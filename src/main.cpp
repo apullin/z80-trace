@@ -31,6 +31,7 @@ struct Config {
     bool loopDetect = true;
     bool quiet = false;
     bool summary = false;
+    bool busTrace = false;
     bool entrySet = false;
     std::vector<UINT16> stopAddrs;
     std::vector<MemoryDump> dumps;
@@ -66,6 +67,7 @@ static void PrintUsage(const char *prog) {
     fprintf(stderr, "  -o, --output=FILE     Output file (default: stdout)\n");
     fprintf(stderr, "  -q, --quiet           Only output trace or summary JSON\n");
     fprintf(stderr, "  -S, --summary         Output only final state as JSON, unless tracepoints are set\n");
+    fprintf(stderr, "  --bus-trace           Emit harness-style BUS/WRITE/HALT lines instead of NDJSON trace records\n");
     fprintf(stderr, "  -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)\n");
     fprintf(stderr, "  --cov=FILE            Write coverage JSON (pc/opcode hit counts)\n");
     fprintf(stderr, "\n");
@@ -244,6 +246,77 @@ static void OutputTrace(FILE *out, const TraceState &t, const StateZ80 *state) {
             state->c, state->d, state->e, state->h, state->l);
 }
 
+static void OutputBusEvent(FILE *out, UINT64 cycle, const Z80BusEvent &event) {
+    int m1 = 0;
+    int mreq = 0;
+    int iorq = 0;
+    int rd = 0;
+    int wr = 0;
+    const char *kind = "read";
+
+    switch (event.kind) {
+    case Z80_BUS_EVENT_FETCH:
+        kind = "fetch";
+        m1 = 1;
+        mreq = 1;
+        rd = 1;
+        break;
+    case Z80_BUS_EVENT_READ:
+        kind = "read";
+        mreq = 1;
+        rd = 1;
+        break;
+    case Z80_BUS_EVENT_WRITE:
+        kind = "write";
+        mreq = 1;
+        wr = 1;
+        break;
+    }
+
+    fprintf(out,
+            "BUS cycle=%" PRIu64 " kind=%s addr=0x%04X data=0x%02X m1=%d mreq=%d iorq=%d rd=%d wr=%d rfsh=0 halt=0 "
+            "busak=0\n",
+            cycle, kind, event.addr, event.data, m1, mreq, iorq, rd, wr);
+    if (event.kind == Z80_BUS_EVENT_WRITE) {
+        fprintf(out, "WRITE cycle=%" PRIu64 " addr=0x%04X data=0x%02X\n", cycle, event.addr, event.data);
+    }
+}
+
+static void OutputBusStep(FILE *out, UINT64 *cycle, UINT64 *writes, const Z80StepEvents &events) {
+    for (size_t i = 0; i < events.count; ++i) {
+        OutputBusEvent(out, *cycle, events.events[i]);
+        if (events.events[i].kind == Z80_BUS_EVENT_WRITE) {
+            *writes += 1;
+        }
+        *cycle += 1;
+    }
+}
+
+static void OutputHexDump(FILE *err, const StateZ80 *state, const MemoryDump &dump) {
+    fprintf(err, "\nMemory dump 0x%04X - 0x%04X (%u bytes):\n", dump.start, (UINT16)(dump.start + dump.length - 1),
+            dump.length);
+    for (UINT16 offset = 0; offset < dump.length; offset += 16) {
+        fprintf(err, "  %04X:", (UINT16)(dump.start + offset));
+        for (UINT16 i = 0; i < 16 && offset + i < dump.length; ++i) {
+            UINT16 addr = (UINT16)(dump.start + offset + i);
+            fprintf(err, " %02X", state->memory[addr]);
+        }
+        fprintf(err, "  |");
+        for (UINT16 i = 0; i < 16 && offset + i < dump.length; ++i) {
+            UINT8 byte = state->memory[(UINT16)(dump.start + offset + i)];
+            fprintf(err, "%c", (byte >= 32 && byte < 127) ? byte : '.');
+        }
+        fprintf(err, "|\n");
+    }
+}
+
+static void OutputBusDump(FILE *out, const StateZ80 *state, const MemoryDump &dump) {
+    for (UINT16 offset = 0; offset < dump.length; ++offset) {
+        UINT16 addr = (UINT16)(dump.start + offset);
+        fprintf(out, "MEM addr=0x%04X data=0x%02X\n", addr, state->memory[addr]);
+    }
+}
+
 static void WriteCoverage(const char *path, UINT64 steps, const std::vector<UINT64> &pcHits,
                           const std::vector<UINT64> &opHits) {
     FILE *f = fopen(path, "w");
@@ -324,6 +397,7 @@ int main(int argc, char *argv[]) {
         {"tracepoint-file", required_argument, nullptr, 'T'},
         {"tracepoint-max", required_argument, nullptr, 'M'},
         {"tracepoint-stop", no_argument, nullptr, 'P'},
+        {"bus-trace", no_argument, nullptr, 1007},
         {"irq", required_argument, nullptr, 1001},
         {"timer", required_argument, nullptr, 1002},
         {"io-plugin", required_argument, nullptr, 1003},
@@ -409,6 +483,9 @@ int main(int argc, char *argv[]) {
         case 'P':
             cfg.tracepointStop = true;
             break;
+        case 1007:
+            cfg.busTrace = true;
+            break;
         case 1001:
         case 1002:
         case 1003:
@@ -448,6 +525,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (cfg.busTrace && cfg.summary) {
+        fprintf(stderr, "Error: --bus-trace cannot be combined with --summary\n");
+        return 1;
+    }
+
     StateZ80 *state = InitZ80();
     if (!state) {
         fprintf(stderr, "Error: Failed to allocate CPU state\n");
@@ -471,7 +553,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (!cfg.quiet && !cfg.summary) {
+    if (!cfg.quiet && !cfg.summary && !cfg.busTrace) {
         fprintf(stderr, "Z80 Trace\n");
         fprintf(stderr, "  Input:  %s\n", cfg.inputFile);
         fprintf(stderr, "  Load:   0x%04X\n", cfg.loadAddr);
@@ -508,6 +590,8 @@ int main(int argc, char *argv[]) {
     const char *haltReason = "max";
     int exitCode = 0;
     UINT64 totalTracepointHits = 0;
+    UINT64 busCycle = 0;
+    UINT64 totalBusWrites = 0;
 
     while (step < cfg.maxSteps) {
         UINT16 pc = state->pc;
@@ -536,10 +620,13 @@ int main(int argc, char *argv[]) {
         pcHits[pc] += 1;
         opHits[opcode] += 1;
 
-        Z80StepResult result = EmulateZ80Op(state, &stats);
+        Z80StepEvents events = {};
+        Z80StepResult result = EmulateZ80Op(state, &stats, cfg.busTrace ? &events : nullptr);
         TraceState trace = {step, pc, sp, flags, clocks, mnemonicBuf, disasmBuf};
 
-        if (!cfg.summary || tp != nullptr) {
+        if (cfg.busTrace) {
+            OutputBusStep(out, &busCycle, &totalBusWrites, events);
+        } else if (!cfg.summary || tp != nullptr) {
             OutputTrace(out, trace, state);
         }
 
@@ -577,7 +664,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (!cfg.quiet && !cfg.summary) {
+    if (!cfg.quiet && !cfg.summary && !cfg.busTrace) {
         fprintf(stderr, "\nExecution complete:\n");
         fprintf(stderr, "  Instructions: %" PRIu64 "\n", step);
         fprintf(stderr, "  Clocks:       %" PRIu64 " (rough estimate)\n", stats.total_tstates);
@@ -600,21 +687,16 @@ int main(int argc, char *argv[]) {
     }
 
     for (const auto &dump : cfg.dumps) {
-        fprintf(stderr, "\nMemory dump 0x%04X - 0x%04X (%u bytes):\n", dump.start,
-                (UINT16)(dump.start + dump.length - 1), dump.length);
-        for (UINT16 offset = 0; offset < dump.length; offset += 16) {
-            fprintf(stderr, "  %04X:", (UINT16)(dump.start + offset));
-            for (UINT16 i = 0; i < 16 && offset + i < dump.length; ++i) {
-                UINT16 addr = (UINT16)(dump.start + offset + i);
-                fprintf(stderr, " %02X", state->memory[addr]);
-            }
-            fprintf(stderr, "  |");
-            for (UINT16 i = 0; i < 16 && offset + i < dump.length; ++i) {
-                UINT8 byte = state->memory[(UINT16)(dump.start + offset + i)];
-                fprintf(stderr, "%c", (byte >= 32 && byte < 127) ? byte : '.');
-            }
-            fprintf(stderr, "|\n");
+        if (cfg.busTrace) {
+            OutputBusDump(out, state, dump);
+        } else {
+            OutputHexDump(stderr, state, dump);
         }
+    }
+
+    if (cfg.busTrace && strcmp(haltReason, "hlt") == 0 && exitCode == 0) {
+        fprintf(out, "HALT cycle=%" PRIu64 " addr=0x%04X\n", busCycle, state->pc);
+        fprintf(out, "PASS cycles=%" PRIu64 " writes=%" PRIu64 "\n", stats.total_tstates, totalBusWrites);
     }
 
     if (cfg.outputFile) {

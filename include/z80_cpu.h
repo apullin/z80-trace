@@ -14,6 +14,25 @@ typedef enum Z80StepResult {
     Z80_STEP_UNIMPLEMENTED = 2,
 } Z80StepResult;
 
+typedef enum Z80BusEventKind {
+    Z80_BUS_EVENT_FETCH = 0,
+    Z80_BUS_EVENT_READ = 1,
+    Z80_BUS_EVENT_WRITE = 2,
+} Z80BusEventKind;
+
+typedef struct Z80BusEvent {
+    Z80BusEventKind kind;
+    UINT16 addr;
+    UINT8 data;
+} Z80BusEvent;
+
+#define Z80_MAX_STEP_EVENTS 16
+
+typedef struct Z80StepEvents {
+    Z80BusEvent events[Z80_MAX_STEP_EVENTS];
+    size_t count;
+} Z80StepEvents;
+
 typedef struct StateZ80 {
     UINT8 a;
     UINT8 f;
@@ -46,7 +65,7 @@ StateZ80 *InitZ80(void);
 void FreeZ80(StateZ80 *state);
 void ResetZ80(StateZ80 *state, UINT16 pc, UINT16 sp);
 
-Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats);
+Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats, Z80StepEvents *events);
 int DisassembleZ80Op(const UINT8 *codebuffer, int pc, char *out, size_t out_len);
 
 UINT8 *GetZ80Memory(StateZ80 *state);

@@ -16,6 +16,7 @@ This checklist compares `z80-trace` against the reference tool's architecture an
 - [x] Choose separate entry point and stack pointer values.
 - [x] Emit per-instruction NDJSON trace records.
 - [x] Emit a final summary JSON record in summary mode.
+- [x] Emit harness-comparable `BUS`, `WRITE`, `HALT`, `MEM`, and `PASS` lines in `--bus-trace` mode.
 - [x] Write sparse coverage JSON for PC and opcode hit counts.
 - [x] Dump memory ranges on exit.
 - [x] Support stop-at addresses.
@@ -26,6 +27,7 @@ This checklist compares `z80-trace` against the reference tool's architecture an
 ## CPU Completeness
 
 - [x] Working baseline for a coherent subset of unprefixed Z80 instructions.
+- [x] Bounded stack/loop/exchange coverage sufficient for the current `z80new` harness fixture suite.
 - [ ] Full unprefixed Z80 opcode coverage.
 - [ ] `CB` prefixed opcodes.
 - [ ] `ED` prefixed opcodes.
@@ -37,10 +39,11 @@ This checklist compares `z80-trace` against the reference tool's architecture an
 
 ## Validation State
 
-- [x] Automated tests cover trace emission, summary mode, coverage writing, memory dumps, and tracepoint stopping.
+- [x] Automated tests cover trace emission, summary mode, coverage writing, memory dumps, tracepoint stopping, `--bus-trace`, and the current stack/loop/exchange tranche.
+- [x] Repo-local differential checks compare the current `z80new` RTL harness against `z80-trace` on a documented directed fixture suite.
 - [ ] Tests demonstrate broad instruction-family coverage across the full Z80 ISA.
 - [ ] Tests cross-check behavior against primary-source Z80 documentation or later golden-reference corpora.
 
 ## Readiness Statement
 
-The project has reached architectural parity with the reference repo's first-order shape and developer workflow. It has not yet reached verification parity because the implemented Z80 execution surface is still intentionally partial.
+The project has reached architectural parity with the reference repo's first-order shape and now also supports a first bounded harness-use path in `z80new`. It has not reached full verification parity because the implemented Z80 execution surface is still intentionally partial and the strongest evidence is still the directed fixture suite rather than broad Z80 conformance.

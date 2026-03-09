@@ -30,6 +30,9 @@ int DisassembleZ80Op(const UINT8 *codebuffer, int pc, char *out, size_t out_len)
     case 0x01:
         snprintf(out, out_len, "LD BC,$%04X", Read16(codebuffer, pc));
         return 3;
+    case 0x10:
+        snprintf(out, out_len, "DJNZ $%04X", RelativeTarget(pc, codebuffer[(pc + 1) & 0xFFFF]));
+        return 2;
     case 0x11:
         snprintf(out, out_len, "LD DE,$%04X", Read16(codebuffer, pc));
         return 3;
@@ -60,6 +63,12 @@ int DisassembleZ80Op(const UINT8 *codebuffer, int pc, char *out, size_t out_len)
     case 0xC3:
         snprintf(out, out_len, "JP $%04X", Read16(codebuffer, pc));
         return 3;
+    case 0xC1:
+        snprintf(out, out_len, "POP BC");
+        return 1;
+    case 0xC5:
+        snprintf(out, out_len, "PUSH BC");
+        return 1;
     case 0xC6:
         snprintf(out, out_len, "ADD A,$%02X", codebuffer[(pc + 1) & 0xFFFF]);
         return 2;
@@ -69,12 +78,33 @@ int DisassembleZ80Op(const UINT8 *codebuffer, int pc, char *out, size_t out_len)
     case 0xCD:
         snprintf(out, out_len, "CALL $%04X", Read16(codebuffer, pc));
         return 3;
+    case 0xD1:
+        snprintf(out, out_len, "POP DE");
+        return 1;
+    case 0xD5:
+        snprintf(out, out_len, "PUSH DE");
+        return 1;
     case 0xD6:
         snprintf(out, out_len, "SUB $%02X", codebuffer[(pc + 1) & 0xFFFF]);
         return 2;
+    case 0xE1:
+        snprintf(out, out_len, "POP HL");
+        return 1;
+    case 0xE5:
+        snprintf(out, out_len, "PUSH HL");
+        return 1;
+    case 0xEB:
+        snprintf(out, out_len, "EX DE,HL");
+        return 1;
     case 0xEE:
         snprintf(out, out_len, "XOR $%02X", codebuffer[(pc + 1) & 0xFFFF]);
         return 2;
+    case 0xF1:
+        snprintf(out, out_len, "POP AF");
+        return 1;
+    case 0xF5:
+        snprintf(out, out_len, "PUSH AF");
+        return 1;
     case 0xF6:
         snprintf(out, out_len, "OR $%02X", codebuffer[(pc + 1) & 0xFFFF]);
         return 2;

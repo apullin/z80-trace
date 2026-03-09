@@ -16,18 +16,60 @@ static UINT16 GetHL(const StateZ80 *state) {
     return (UINT16)((state->h << 8) | state->l);
 }
 
+static UINT16 GetBC(const StateZ80 *state) {
+    return (UINT16)((state->b << 8) | state->c);
+}
+
+static UINT16 GetDE(const StateZ80 *state) {
+    return (UINT16)((state->d << 8) | state->e);
+}
+
 static void SetHL(StateZ80 *state, UINT16 value) {
     state->h = (UINT8)(value >> 8);
     state->l = (UINT8)(value & 0xFF);
 }
 
-static UINT16 Read16(const UINT8 *mem, UINT16 addr) {
-    return (UINT16)(mem[addr] | (mem[(UINT16)(addr + 1)] << 8));
+static void SetBC(StateZ80 *state, UINT16 value) {
+    state->b = (UINT8)(value >> 8);
+    state->c = (UINT8)(value & 0xFF);
 }
 
-static void Write16(UINT8 *mem, UINT16 addr, UINT16 value) {
-    mem[addr] = (UINT8)(value & 0xFF);
-    mem[(UINT16)(addr + 1)] = (UINT8)(value >> 8);
+static void SetDE(StateZ80 *state, UINT16 value) {
+    state->d = (UINT8)(value >> 8);
+    state->e = (UINT8)(value & 0xFF);
+}
+
+static void TraceEvent(Z80StepEvents *events, Z80BusEventKind kind, UINT16 addr, UINT8 data) {
+    if (!events || events->count >= Z80_MAX_STEP_EVENTS) {
+        return;
+    }
+
+    events->events[events->count].kind = kind;
+    events->events[events->count].addr = addr;
+    events->events[events->count].data = data;
+    events->count += 1;
+}
+
+static UINT8 ReadByte(StateZ80 *state, Z80StepEvents *events, UINT16 addr, Z80BusEventKind kind) {
+    UINT8 value = state->memory[addr];
+    TraceEvent(events, kind, addr, value);
+    return value;
+}
+
+static void WriteByte(StateZ80 *state, Z80StepEvents *events, UINT16 addr, UINT8 value) {
+    state->memory[addr] = value;
+    TraceEvent(events, Z80_BUS_EVENT_WRITE, addr, value);
+}
+
+static UINT16 Read16(StateZ80 *state, Z80StepEvents *events, UINT16 addr) {
+    UINT8 lo = ReadByte(state, events, addr, Z80_BUS_EVENT_READ);
+    UINT8 hi = ReadByte(state, events, (UINT16)(addr + 1), Z80_BUS_EVENT_READ);
+    return (UINT16)(lo | (hi << 8));
+}
+
+static void Write16(StateZ80 *state, Z80StepEvents *events, UINT16 addr, UINT16 value) {
+    WriteByte(state, events, addr, (UINT8)(value & 0xFF));
+    WriteByte(state, events, (UINT16)(addr + 1), (UINT8)(value >> 8));
 }
 
 static int Parity(UINT8 value) {
@@ -145,7 +187,7 @@ static UINT8 LogicOr(StateZ80 *state, UINT8 lhs, UINT8 rhs) {
     return result;
 }
 
-static UINT8 ReadReg8(const StateZ80 *state, int index) {
+static UINT8 ReadReg8(StateZ80 *state, Z80StepEvents *events, int index) {
     switch (index & 7) {
     case 0:
         return state->b;
@@ -160,13 +202,13 @@ static UINT8 ReadReg8(const StateZ80 *state, int index) {
     case 5:
         return state->l;
     case 6:
-        return state->memory[GetHL(state)];
+        return ReadByte(state, events, GetHL(state), Z80_BUS_EVENT_READ);
     default:
         return state->a;
     }
 }
 
-static void WriteReg8(StateZ80 *state, int index, UINT8 value) {
+static void WriteReg8(StateZ80 *state, Z80StepEvents *events, int index, UINT8 value) {
     switch (index & 7) {
     case 0:
         state->b = value;
@@ -187,7 +229,7 @@ static void WriteReg8(StateZ80 *state, int index, UINT8 value) {
         state->l = value;
         break;
     case 6:
-        state->memory[GetHL(state)] = value;
+        WriteByte(state, events, GetHL(state), value);
         break;
     default:
         state->a = value;
@@ -215,34 +257,38 @@ static void SetError(StateZ80 *state, UINT8 opcode) {
     snprintf(state->last_error, sizeof(state->last_error), "unimplemented opcode 0x%02X at 0x%04X", opcode, state->pc);
 }
 
-static void Push16(StateZ80 *state, ExecutionStatsZ80 *stats, UINT16 value) {
+static void Push16(StateZ80 *state, ExecutionStatsZ80 *stats, Z80StepEvents *events, UINT16 value) {
     state->sp = (UINT16)(state->sp - 1);
-    state->memory[state->sp] = (UINT8)(value >> 8);
+    WriteByte(state, events, state->sp, (UINT8)(value >> 8));
     state->sp = (UINT16)(state->sp - 1);
-    state->memory[state->sp] = (UINT8)(value & 0xFF);
+    WriteByte(state, events, state->sp, (UINT8)(value & 0xFF));
     UpdateMinSp(state, stats);
 }
 
-static UINT16 Pop16(StateZ80 *state) {
-    UINT16 value = Read16(state->memory, state->sp);
+static UINT16 Pop16(StateZ80 *state, Z80StepEvents *events) {
+    UINT16 value = Read16(state, events, state->sp);
     state->sp = (UINT16)(state->sp + 2);
     return value;
 }
 
-Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
+Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats, Z80StepEvents *events) {
     UINT8 op;
     UINT16 addr;
     UINT8 imm8;
     UINT8 value;
+    UINT16 value16;
 
     if (!state || !state->memory) {
         return Z80_STEP_UNIMPLEMENTED;
     }
 
     memset(state->last_error, 0, sizeof(state->last_error));
+    if (events) {
+        events->count = 0;
+    }
     state->r = (UINT8)((state->r & 0x80) | ((state->r + 1) & 0x7F));
 
-    op = state->memory[state->pc];
+    op = ReadByte(state, events, state->pc, Z80_BUS_EVENT_FETCH);
 
     switch (op) {
     case 0x00:
@@ -250,26 +296,36 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         AddCycles(stats, 4);
         return Z80_STEP_OK;
     case 0x01:
-        state->c = state->memory[(UINT16)(state->pc + 1)];
-        state->b = state->memory[(UINT16)(state->pc + 2)];
+        value16 = Read16(state, events, (UINT16)(state->pc + 1));
+        SetBC(state, value16);
         state->pc += 3;
         AddCycles(stats, 10);
         return Z80_STEP_OK;
+    case 0x10:
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
+        state->b = (UINT8)(state->b - 1);
+        if (state->b != 0) {
+            state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
+            AddCycles(stats, 13);
+        } else {
+            state->pc += 2;
+            AddCycles(stats, 8);
+        }
+        return Z80_STEP_OK;
     case 0x11:
-        state->e = state->memory[(UINT16)(state->pc + 1)];
-        state->d = state->memory[(UINT16)(state->pc + 2)];
+        value16 = Read16(state, events, (UINT16)(state->pc + 1));
+        SetDE(state, value16);
         state->pc += 3;
         AddCycles(stats, 10);
         return Z80_STEP_OK;
     case 0x21:
-        state->l = state->memory[(UINT16)(state->pc + 1)];
-        state->h = state->memory[(UINT16)(state->pc + 2)];
+        SetHL(state, Read16(state, events, (UINT16)(state->pc + 1)));
         state->pc += 3;
         AddCycles(stats, 10);
         return Z80_STEP_OK;
     case 0x22:
-        addr = Read16(state->memory, (UINT16)(state->pc + 1));
-        Write16(state->memory, addr, GetHL(state));
+        addr = Read16(state, events, (UINT16)(state->pc + 1));
+        Write16(state, events, addr, GetHL(state));
         state->pc += 3;
         AddCycles(stats, 16);
         return Z80_STEP_OK;
@@ -279,26 +335,26 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         AddCycles(stats, 6);
         return Z80_STEP_OK;
     case 0x2A:
-        addr = Read16(state->memory, (UINT16)(state->pc + 1));
-        SetHL(state, Read16(state->memory, addr));
+        addr = Read16(state, events, (UINT16)(state->pc + 1));
+        SetHL(state, Read16(state, events, addr));
         state->pc += 3;
         AddCycles(stats, 16);
         return Z80_STEP_OK;
     case 0x31:
-        state->sp = Read16(state->memory, (UINT16)(state->pc + 1));
+        state->sp = Read16(state, events, (UINT16)(state->pc + 1));
         UpdateMinSp(state, stats);
         state->pc += 3;
         AddCycles(stats, 10);
         return Z80_STEP_OK;
     case 0x32:
-        addr = Read16(state->memory, (UINT16)(state->pc + 1));
-        state->memory[addr] = state->a;
+        addr = Read16(state, events, (UINT16)(state->pc + 1));
+        WriteByte(state, events, addr, state->a);
         state->pc += 3;
         AddCycles(stats, 13);
         return Z80_STEP_OK;
     case 0x3A:
-        addr = Read16(state->memory, (UINT16)(state->pc + 1));
-        state->a = state->memory[addr];
+        addr = Read16(state, events, (UINT16)(state->pc + 1));
+        state->a = ReadByte(state, events, addr, Z80_BUS_EVENT_READ);
         state->pc += 3;
         AddCycles(stats, 13);
         return Z80_STEP_OK;
@@ -308,56 +364,88 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         AddCycles(stats, 4);
         return Z80_STEP_HALT;
     case 0xC3:
-        state->pc = Read16(state->memory, (UINT16)(state->pc + 1));
+        state->pc = Read16(state, events, (UINT16)(state->pc + 1));
         AddCycles(stats, 10);
         return Z80_STEP_OK;
+    case 0xC1:
+        value16 = Pop16(state, events);
+        SetBC(state, value16);
+        AddCycles(stats, 10);
+        state->pc += 1;
+        return Z80_STEP_OK;
     case 0xC6:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         state->a = Add8(state, state->a, imm8, 0);
         state->pc += 2;
         AddCycles(stats, 7);
         return Z80_STEP_OK;
     case 0xC9:
-        state->pc = Pop16(state);
+        state->pc = Pop16(state, events);
         AddCycles(stats, 10);
         return Z80_STEP_OK;
     case 0xCD:
-        addr = Read16(state->memory, (UINT16)(state->pc + 1));
-        Push16(state, stats, (UINT16)(state->pc + 3));
+        addr = Read16(state, events, (UINT16)(state->pc + 1));
+        Push16(state, stats, events, (UINT16)(state->pc + 3));
         state->pc = addr;
         AddCycles(stats, 17);
         return Z80_STEP_OK;
+    case 0xD1:
+        value16 = Pop16(state, events);
+        SetDE(state, value16);
+        AddCycles(stats, 10);
+        state->pc += 1;
+        return Z80_STEP_OK;
     case 0xD6:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         state->a = Sub8(state, state->a, imm8, 0, 1);
         state->pc += 2;
         AddCycles(stats, 7);
         return Z80_STEP_OK;
+    case 0xE1:
+        value16 = Pop16(state, events);
+        SetHL(state, value16);
+        AddCycles(stats, 10);
+        state->pc += 1;
+        return Z80_STEP_OK;
     case 0xEE:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         state->a = LogicXor(state, state->a, imm8);
         state->pc += 2;
         AddCycles(stats, 7);
         return Z80_STEP_OK;
+    case 0xEB:
+        value16 = GetDE(state);
+        SetDE(state, GetHL(state));
+        SetHL(state, value16);
+        state->pc += 1;
+        AddCycles(stats, 4);
+        return Z80_STEP_OK;
+    case 0xF1:
+        value16 = Pop16(state, events);
+        state->f = (UINT8)(value16 & 0xFF);
+        state->a = (UINT8)(value16 >> 8);
+        AddCycles(stats, 10);
+        state->pc += 1;
+        return Z80_STEP_OK;
     case 0xF6:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         state->a = LogicOr(state, state->a, imm8);
         state->pc += 2;
         AddCycles(stats, 7);
         return Z80_STEP_OK;
     case 0xFE:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         (void)Sub8(state, state->a, imm8, 0, 0);
         state->pc += 2;
         AddCycles(stats, 7);
         return Z80_STEP_OK;
     case 0x18:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
         AddCycles(stats, 12);
         return Z80_STEP_OK;
     case 0x20:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         if ((state->f & FLAG_Z) == 0) {
             state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
             AddCycles(stats, 12);
@@ -367,7 +455,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         }
         return Z80_STEP_OK;
     case 0x28:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         if (state->f & FLAG_Z) {
             state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
             AddCycles(stats, 12);
@@ -377,7 +465,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         }
         return Z80_STEP_OK;
     case 0x30:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         if ((state->f & FLAG_C) == 0) {
             state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
             AddCycles(stats, 12);
@@ -387,7 +475,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         }
         return Z80_STEP_OK;
     case 0x38:
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
         if (state->f & FLAG_C) {
             state->pc = (UINT16)(state->pc + 2 + (int8_t)imm8);
             AddCycles(stats, 12);
@@ -400,9 +488,30 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
         break;
     }
 
+    if ((op & 0xCF) == 0xC5) {
+        switch ((op >> 4) & 0x3) {
+        case 0:
+            value16 = GetBC(state);
+            break;
+        case 1:
+            value16 = GetDE(state);
+            break;
+        case 2:
+            value16 = GetHL(state);
+            break;
+        default:
+            value16 = (UINT16)((state->a << 8) | state->f);
+            break;
+        }
+        Push16(state, stats, events, value16);
+        state->pc += 1;
+        AddCycles(stats, 11);
+        return Z80_STEP_OK;
+    }
+
     if ((op & 0xC7) == 0x06) {
-        imm8 = state->memory[(UINT16)(state->pc + 1)];
-        WriteReg8(state, (op >> 3) & 7, imm8);
+        imm8 = ReadByte(state, events, (UINT16)(state->pc + 1), Z80_BUS_EVENT_READ);
+        WriteReg8(state, events, (op >> 3) & 7, imm8);
         state->pc += 2;
         AddCycles(stats, ((op >> 3) & 7) == 6 ? 10 : 7);
         return Z80_STEP_OK;
@@ -410,9 +519,9 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
 
     if ((op & 0xC7) == 0x04) {
         int index = (op >> 3) & 7;
-        value = ReadReg8(state, index);
+        value = ReadReg8(state, events, index);
         value = Inc8(state, value);
-        WriteReg8(state, index, value);
+        WriteReg8(state, events, index, value);
         state->pc += 1;
         AddCycles(stats, index == 6 ? 11 : 4);
         return Z80_STEP_OK;
@@ -420,9 +529,9 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
 
     if ((op & 0xC7) == 0x05) {
         int index = (op >> 3) & 7;
-        value = ReadReg8(state, index);
+        value = ReadReg8(state, events, index);
         value = Dec8(state, value);
-        WriteReg8(state, index, value);
+        WriteReg8(state, events, index, value);
         state->pc += 1;
         AddCycles(stats, index == 6 ? 11 : 4);
         return Z80_STEP_OK;
@@ -431,15 +540,15 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
     if ((op & 0xC0) == 0x40 && op != 0x76) {
         int dst = (op >> 3) & 7;
         int src = op & 7;
-        value = ReadReg8(state, src);
-        WriteReg8(state, dst, value);
+        value = ReadReg8(state, events, src);
+        WriteReg8(state, events, dst, value);
         state->pc += 1;
         AddCycles(stats, (dst == 6 || src == 6) ? 7 : 4);
         return Z80_STEP_OK;
     }
 
     if ((op & 0xF8) == 0x80) {
-        value = ReadReg8(state, op & 7);
+        value = ReadReg8(state, events, op & 7);
         state->a = Add8(state, state->a, value, 0);
         state->pc += 1;
         AddCycles(stats, (op & 7) == 6 ? 7 : 4);
@@ -447,7 +556,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
     }
 
     if ((op & 0xF8) == 0x90) {
-        value = ReadReg8(state, op & 7);
+        value = ReadReg8(state, events, op & 7);
         state->a = Sub8(state, state->a, value, 0, 1);
         state->pc += 1;
         AddCycles(stats, (op & 7) == 6 ? 7 : 4);
@@ -455,7 +564,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
     }
 
     if ((op & 0xF8) == 0xA8) {
-        value = ReadReg8(state, op & 7);
+        value = ReadReg8(state, events, op & 7);
         state->a = LogicXor(state, state->a, value);
         state->pc += 1;
         AddCycles(stats, (op & 7) == 6 ? 7 : 4);
@@ -463,7 +572,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
     }
 
     if ((op & 0xF8) == 0xB0) {
-        value = ReadReg8(state, op & 7);
+        value = ReadReg8(state, events, op & 7);
         state->a = LogicOr(state, state->a, value);
         state->pc += 1;
         AddCycles(stats, (op & 7) == 6 ? 7 : 4);
@@ -471,7 +580,7 @@ Z80StepResult EmulateZ80Op(StateZ80 *state, ExecutionStatsZ80 *stats) {
     }
 
     if ((op & 0xF8) == 0xB8) {
-        value = ReadReg8(state, op & 7);
+        value = ReadReg8(state, events, op & 7);
         (void)Sub8(state, state->a, value, 0, 0);
         state->pc += 1;
         AddCycles(stats, (op & 7) == 6 ? 7 : 4);
