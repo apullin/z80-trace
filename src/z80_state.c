@@ -15,6 +15,13 @@ StateZ80 *InitZ80(void) {
         return NULL;
     }
 
+    state->io_space = (UINT8 *)calloc(0x10000u, sizeof(UINT8));
+    if (!state->io_space) {
+        free(state->memory);
+        free(state);
+        return NULL;
+    }
+
     return state;
 }
 
@@ -23,6 +30,7 @@ void FreeZ80(StateZ80 *state) {
         return;
     }
 
+    free(state->io_space);
     free(state->memory);
     free(state);
 }
@@ -34,20 +42,33 @@ void ResetZ80(StateZ80 *state, UINT16 pc, UINT16 sp) {
 
     state->a = 0;
     state->f = 0;
+    state->a_alt = 0;
+    state->f_alt = 0;
     state->b = 0;
     state->c = 0;
+    state->b_alt = 0;
+    state->c_alt = 0;
     state->d = 0;
     state->e = 0;
+    state->d_alt = 0;
+    state->e_alt = 0;
     state->h = 0;
     state->l = 0;
+    state->h_alt = 0;
+    state->l_alt = 0;
     state->ix = 0;
     state->iy = 0;
     state->sp = sp;
     state->pc = pc;
     state->i = 0;
     state->r = 0;
+    state->im = 0;
     state->iff1 = 0;
     state->iff2 = 0;
+    state->ei_pending = 0;
+    state->nmi_pending = 0;
+    state->irq_pending = 0;
+    state->irq_vector = 0xFF;
     state->halted = 0;
     memset(state->last_error, 0, sizeof(state->last_error));
 }
